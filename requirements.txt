@@ -8,3 +8,7 @@ pydantic
 pydantic-settings
 celery
 aiohttp
+xgboost
+pandas
+scikit-learn
+joblib

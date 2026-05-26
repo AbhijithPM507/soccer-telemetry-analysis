@@ -1,4 +1,4 @@
-`__pycache__/
+__pycache__/
 *.py[cod]
 *.egg-info/
 dist/
@@ -13,5 +13,6 @@ env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+plan.md
 .DS_Store
 Thumbs.db
