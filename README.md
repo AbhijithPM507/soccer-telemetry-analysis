@@ -22,15 +22,15 @@ High-throughput, real-time soccer match telemetry ingestion and ML inference eng
 │                     Redis Buffer (telemetry_buffer)              │
 │                     Acts as a shock absorber                     │
 └─────────────────────────┬───────────────────────────────────────┘
-                          │ RPOP (batch of up to 1000)
+                          │ Celery beat triggers every 2s
                           ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│              Background Batch Worker (every 2s)                  │
-│              app/workers/batch_processor.py                      │
+│              Celery Worker (process_batch_task)                  │
+│              app/workers/tasks.py → batch_processor.py           │
 │                                                                  │
 │   ┌─────────────┐    ┌──────────────────┐    ┌───────────────┐  │
-│   │ Parse JSON  │───▶│ XGBoost Inference │───▶│ Bulk Insert   │  │
-│   │ batch       │    │ (goal probability) │    │ PostgreSQL    │  │
+│   │ RPOP batch  │───▶│ XGBoost Inference │───▶│ Bulk Insert   │  │
+│   │ from Redis  │    │ (goal probability) │    │ PostgreSQL    │  │
 │   └─────────────┘    └────────┬─────────┘    └───────┬───────┘  │
 │                               │                       │          │
 │                               ▼                       ▼          │
@@ -97,15 +97,17 @@ sequenceDiagram
 
 ## Tech Stack
 
-| Component     | Technology                                      |
-|---------------|-------------------------------------------------|
-| API Framework | FastAPI (Uvicorn async workers)                 |
-| Database      | PostgreSQL 15 (async via asyncpg/SQLAlchemy 2.0)|
-| Cache/Buffer  | Redis 7 (async via redis-py)                    |
-| ML Inference  | XGBoost Classifier (28 features)                |
-| Migrations    | Alembic                                         |
-| Validation    | Pydantic v2                                     |
-| Infra         | Docker Compose                                  |
+| Component       | Technology                                      |
+|-----------------|-------------------------------------------------|
+| API Framework   | FastAPI (Uvicorn async workers)                 |
+| Database        | PostgreSQL 15 (async via asyncpg/SQLAlchemy 2.0)|
+| Cache/Buffer    | Redis 7 (async via redis-py)                    |
+| ML Inference    | XGBoost Classifier (28 features)                |
+| Task Queue      | Celery (Redis broker, solo pool)                |
+| Migrations      | Alembic                                         |
+| Validation      | Pydantic v2                                     |
+| Container       | Docker                                          |
+| Orchestration   | Kubernetes (Minikube)                           |
 
 ## Project Structure
 
@@ -116,6 +118,7 @@ soccer-telemetry/
 │   │   ├── ingest.py        # POST /api/telemetry → Redis buffer
 │   │   └── matches.py       # GET /api/matches/{id}/live-summary
 │   ├── core/
+│   │   ├── celery_app.py    # Celery app + beat schedule
 │   │   ├── config.py        # pydantic-settings from .env
 │   │   ├── database.py      # Async SQLAlchemy engine + session
 │   │   └── redis.py         # Async Redis client singleton
@@ -127,12 +130,19 @@ soccer-telemetry/
 │   ├── schemas/
 │   │   └── telemetry.py     # TelemetryEventInput Pydantic model
 │   ├── workers/
-│   │   └── batch_processor.py  # Background micro-batching loop
+│   │   ├── batch_processor.py  # Micro-batching logic
+│   │   └── tasks.py         # Celery task definition
 │   └── main.py              # FastAPI app, lifespan, router mount
 ├── scripts/
 │   └── simulate.py          # Stress-test simulator (aiohttp)
+├── k8s/                     # Kubernetes manifests
+│   ├── postgres.yaml        # StatefulSet + PVC + Service
+│   ├── redis.yaml           # Deployment + Service
+│   ├── api.yaml             # FastAPI Deployment + NodePort
+│   └── worker.yaml          # Celery worker Deployment
 ├── alembic/                 # DB migrations
-├── docker-compose.yml       # Postgres 15 + Redis 7
+├── docker-compose.yml       # Postgres 15 + Redis 7 (local dev)
+├── Dockerfile               # Production container image
 ├── requirements.txt
 ├── .env / .env.example
 └── README.md
@@ -146,7 +156,7 @@ soccer-telemetry/
 - Docker Desktop
 - 1 GB free RAM
 
-### Quick Start
+### Local Development (Docker Compose)
 
 ```bash
 # 1. Start infrastructure
@@ -159,14 +169,55 @@ pip install -r requirements.txt
 # 3. Run database migrations
 alembic upgrade head
 
-# 4. Start the server
+# 4. Start the API server
 uvicorn app.main:app --reload
 
-# 5. Run the stress test (15s at 100 req/s)
+# 5. Start the Celery worker (separate terminal)
+celery -A app.core.celery_app worker -B --pool=solo --loglevel=info
+
+# 6. Run the stress test (15s at 100 req/s)
 python scripts/simulate.py
 ```
 
 Server runs at `http://localhost:8000`. Interactive docs at `/docs`.
+
+### Kubernetes Deployment (Minikube)
+
+```bash
+# 1. Start Minikube
+minikube start --driver=docker
+
+# 2. Build image into Minikube's Docker daemon
+minikube image build -t soccer-backend:latest .
+
+# 3. Deploy infrastructure
+kubectl apply -f k8s/redis.yaml
+kubectl apply -f k8s/postgres.yaml
+
+# 4. Run database migrations
+kubectl exec deployment/api -- alembic upgrade head
+
+# 5. Deploy application
+kubectl apply -f k8s/api.yaml
+kubectl apply -f k8s/worker.yaml
+
+# 6. Access the API
+kubectl port-forward deployment/api 8000:8000
+
+# 7. Run the stress test
+python scripts/simulate.py
+```
+
+### Building the Docker Image
+
+```bash
+docker build -t soccer-backend:latest .
+```
+
+Note: When deploying to Minikube, build directly into its daemon:
+```bash
+minikube image build -t soccer-backend:latest .
+```
 
 ## API Reference
 
@@ -226,9 +277,23 @@ Features are derived on-the-fly from raw `(x, y, event_type)` — the simulator 
 
 ## Stress Test Results
 
-- **1200 events** injected over 15 seconds
-- **100 concurrent requests/sec**
-- **0 failures** (100% 202 Accepted)
-- **74 req/s** sustained throughput
-- All events persisted in PostgreSQL
-- XGBoost predictions stored in Redis and served via `live-summary`
+### Local (Docker Compose)
+
+| Metric | Value |
+|--------|-------|
+| Events injected | 1200 over 15s |
+| Concurrency | 100 req/s |
+| Failures | 0 (100% 202 Accepted) |
+| Throughput | 74 req/s |
+| Data persistence | PostgreSQL + Redis predictions |
+
+### Kubernetes (Minikube, `--pool=solo`)
+
+| Metric | Value |
+|--------|-------|
+| Events injected | 1100 over 15s |
+| Concurrency | 100 req/s |
+| Failures | 0 (100% 202 Accepted) |
+| Throughput | 68 req/s |
+| Worker batch time | 0.4–1.5s per batch |
+| SIGSEGV | None (resolved by `--pool=solo`) |

@@ -10,9 +10,13 @@ env/
 !.env.example
 *.db
 *.sqlite
+*.log
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+.minikube/
 plan.md
 .DS_Store
 Thumbs.db
